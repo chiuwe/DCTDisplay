@@ -11,23 +11,47 @@
 #define BUTTON_RADIUS 10
 #define BUTTON_Y_START 348
 
+#define DOT_RADIUS 10
+#define DOT_SPACING 25
+
 #define FT5316_INT 7
 
-const int RA8876_XNSCS = 10;
-const int RA8876_XNRESET = 9;
+#define RA8876_XNSCS 10
+#define RA8876_XNRESET 9
 
 uint8_t addr = 0x38;
 
-enum Selector {Reverse, Neutral, Manual, Auto};
+uint8_t dotLetters[9][2][35] =  {{{1,1,1,1,1,1,1,2,3,4,5,5,2,3,4,3,4,5},  // R x
+                                 {1,2,3,4,5,6,7,1,1,1,2,3,4,4,4,5,6,7}},  // R y
+                                {{1,1,1,1,1,1,1,2,3,4,5,5,5,5,5,5,5},     // N x
+                                 {1,2,3,4,5,6,7,3,4,5,1,2,3,4,5,6,7}},    // N y
+                                {{2,3,3,3,3,3,3,2,3,4,},                  // 1 x
+                                 {2,1,2,3,4,5,6,7,7,7,}},                 // 1 y
+                                {{1,2,3,4,5,5,4,3,2,1,2,3,4,5},           // 2 x
+                                 {2,1,1,1,2,3,4,5,6,7,7,7,7,7}},          // 2 y
+                                {{1,2,3,4,5,5,4,3,2,5,5,4,3,2,1},         // 3 x
+                                 {1,1,1,1,2,3,4,4,4,5,6,7,7,7,7}},        // 3 y
+                                {{1,1,1,1,2,3,4,5,5,5,5,5,5,5},           // 4 x
+                                 {1,2,3,4,4,4,4,1,2,3,4,5,6,7}},          // 4 y
+                                {{5,4,3,2,1,1,1,1,2,3,4,5,5,4,3,2,1},     // 5 x
+                                 {1,1,1,1,1,2,3,4,4,4,4,5,6,7,7,7,7}},    // 5 y
+                                {{4,3,2,1,1,1,1,1,2,3,4,5,5,4,3,2},       // 6 x
+                                 {1,1,1,2,3,4,5,6,7,7,7,6,5,4,4,4}},      // 6 y
+                                {{1,2,3,4,5,5,5,4,3,3,3},                 // 7 x
+                                 {1,1,1,1,1,2,3,4,5,6,7}}};               // 7 y
 
 struct TouchLocation {
   uint16_t x;
   uint16_t y;
 };
 
+enum Selector {Reverse, Neutral, Manual, Auto};
+
 TouchLocation touchLocations[5];
 uint16_t buttonXStart[4];
 bool buttonDown[4];
+uint8_t currentGear = -1;
+CAN_FRAME outgoing;
 
 Ra8876_Lite ra8876lite(RA8876_XNSCS, RA8876_XNRESET);
 
@@ -36,20 +60,27 @@ void drawReverse();
 void drawNeutral();
 void drawManual();
 void drawAuto();
+int drawDotLetter(uint8_t gear);
 
 uint8_t readFT5316TouchRegister(uint8_t reg);
 uint8_t readFT5316TouchLocation(TouchLocation *pLoc, uint8_t num);
 uint8_t readFT5316TouchAddr(uint8_t regAddr, uint8_t * pBuf, uint8_t len);
 
-void setup() {
+void parseIncomingFrame(CAN_FRAME &frame);
+
+void setup(){
+  char str[] = "DCT Temp (C)";
   Serial.begin(9600);
   Wire.begin();
 
   // Setup CANbus
   Can0.init(CAN_BPS_500K);
-  Can1.init(CAN_BPS_500K);
 
   Can0.watchFor();
+
+  // Setup outgoing can frame
+  outgoing.id = 0x861;
+  outgoing.extended = false;
 
   // Setup touchscreen
   // turn on backlight
@@ -70,10 +101,24 @@ void setup() {
     buttonXStart[i] = 4 + (i * 256);
     drawButton((Selector)i, COLOR65K_BLUE2, COLOR65K_DARKBLUE);
   }
+  drawDotLetter(0);
+
+  ra8876lite.setTextParameter1(RA8876_SELECT_INTERNAL_CGROM,RA8876_CHAR_HEIGHT_32,RA8876_SELECT_8859_1);
+  ra8876lite.setTextParameter2(RA8876_TEXT_FULL_ALIGN_DISABLE,RA8876_TEXT_CHROMA_KEY_DISABLE,RA8876_TEXT_WIDTH_ENLARGEMENT_X1,RA8876_TEXT_HEIGHT_ENLARGEMENT_X1);
+  ra8876lite.putString(0,200,str);
+  ra8876lite.textColor(COLOR65K_GREEN, COLOR65K_BLACK);
+  ra8876lite.putDec(0, 230, 0, 3, "n");
 }
 
 void loop() {
   uint8_t attention = digitalRead(FT5316_INT);
+  uint8_t nextGear = currentGear;
+  CAN_FRAME incoming;
+
+  if(Can0.available()){
+    Can0.read(incoming);
+    parseIncomingFrame(incoming);
+  }
 
   if(!attention){
     uint8_t touch = readFT5316TouchLocation(touchLocations, 1);
@@ -87,6 +132,8 @@ void loop() {
           if(!buttonDown[i] && x >= start && x <= start + BUTTON_SIZE){
             drawButton((Selector)i, COLOR65K_DARKRED, COLOR65K_LIGHTRED);
             buttonDown[i] = true;
+            outgoing.data.byte[0] = i;
+            Can0.sendFrame(outgoing);
           }else if(buttonDown[i] && (x < start || x > start + BUTTON_SIZE)){
             drawButton((Selector)i, COLOR65K_BLUE2, COLOR65K_DARKBLUE);
             buttonDown[i] = false;
@@ -101,6 +148,21 @@ void loop() {
         }
       }
     }
+  }
+  drawDotLetter(nextGear);
+}
+
+void parseIncomingFrame(CAN_FRAME &frame) {
+  switch(frame.id){
+    case 0x168:
+      // current gear
+      drawDotLetter(frame.data.byte[0]);
+      // dct oil temp
+      ra8876lite.textColor(COLOR65K_GREEN, COLOR65K_BLACK);
+      ra8876lite.putDec(0, 230, frame.data.byte[1], 3, "n");
+      break;
+      // TODO: maybe print to screen frame ID?
+    //default:
   }
 }
 
@@ -151,6 +213,22 @@ uint8_t readFT5316TouchLocation(TouchLocation *pLoc, uint8_t num){
   }
 
   return k;
+}
+
+int drawDotLetter(uint8_t gear){
+  uint8_t *x = dotLetters[gear][0];
+  uint8_t *y = dotLetters[gear][1];
+  uint8_t i = 0;
+
+  if(gear == currentGear || gear > 8) return -1;
+  ra8876lite.drawSquareFill(0, 0, 5*DOT_SPACING+DOT_RADIUS, 7*DOT_SPACING+DOT_RADIUS, COLOR65K_BLACK);
+  while(x[i]){
+    ra8876lite.drawCircleFill(x[i]*DOT_SPACING-DOT_RADIUS, y[i]*DOT_SPACING-DOT_RADIUS, DOT_RADIUS, COLOR65K_YELLOW);
+    i++;
+  }
+  currentGear = gear;
+
+  return 0;
 }
 
 void drawButton(Selector select, uint16_t outColor, uint16_t inColor){
